@@ -1,4 +1,4 @@
-# Cartographer 3D Script v2.3 w/ Temperature Compensation
+# Cartographer 3D Script v1.0.0.34 w/ Temperature Compensation
 # To buy affordable bed scanners, check out https://cartographer3d.com
 # 
 # Based on the outstanding work from the Beacon3D Team, with modifications made by the Cartographer and IDM team. 
@@ -9,6 +9,8 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import threading
+import multiprocessing
+import traceback
 import logging
 import chelper
 import pins
@@ -90,6 +92,8 @@ class CartographerProbe:
             config.getfloat("filter_beta", 0.000001),
         )
         self.trapq = None
+        self._last_trapq_move = None
+        self.mod_axis_twist_comp = None	
 
         mainsync = self.printer.lookup_object("mcu")._clocksync
         self._mcu = MCU(config, SecondarySync(self.reactor, mainsync))
@@ -135,6 +139,9 @@ class CartographerProbe:
 
     def _handle_connect(self):
         self.phoming = self.printer.lookup_object("homing")
+        self.mod_axis_twist_comp = self.printer.lookup_object(
+            "axis_twist_compensation", None
+        )
 
         # Ensure streaming mode is stopped
         self.cartographer_stream_cmd.send([0])
@@ -178,7 +185,11 @@ class CartographerProbe:
             cq=self.cmd_queue)
 
     def stats(self, eventtime):
-        return False, "%s: coil_temp=%.1f" % (self.name, self.last_temp)
+        return False, "%s: coil_temp=%.1f refs=%s" % (	
+            self.name,
+            self.last_temp,
+            self._stream_en,
+        )
 
     # Virtual endstop
 
@@ -273,9 +284,7 @@ class CartographerProbe:
             # correct height and take a new sample.
             self._move_to_probing_height(speed)
             (dist, samples) = self._sample(self.z_settling_time, num_samples)
-
         pos = samples[0]["pos"]
-
         self.gcode.respond_info("probe at %.3f,%.3f,%.3f is z=%.6f"
                                 % (pos[0], pos[1], pos[2], dist))
 
@@ -317,7 +326,11 @@ class CartographerProbe:
             if "z" not in kin_status["homed_axes"]:
                 self.toolhead.get_last_move_time()
                 pos = self.toolhead.get_position()
-                pos[2] = kin_status["axis_maximum"][2] - 1.0
+                pos[2] = (
+                    kin_status["axis_maximum"][2]
+                    - 2.0
+                    - gcmd.get_float("CEIL", self.cal_ceil)
+                )
                 self.toolhead.set_position(pos, homing_axes=[2])
                 forced_z = True
 
@@ -359,10 +372,6 @@ class CartographerProbe:
 
         samples = []
         def cb(sample):
-            # (x, y, z) = sample['pos']
-            # x += xo
-            # y += yo
-            # sample['pos'] = (x, y, z)
             samples.append(sample)
 
         try:
@@ -470,9 +479,11 @@ class CartographerProbe:
     def _enrich_sample(self, sample):
         sample["dist"] = self.freq_to_dist(sample["freq"], sample["temp"])
         pos, vel = self._get_trapq_position(sample["time"])
-
+        
         if pos is None:
             return
+        if sample["dist"] is not None and self.mod_axis_twist_comp:
+            sample["dist"] -= self.mod_axis_twist_comp.get_z_compensation_value(pos)
         sample["pos"] = pos
         sample["vel"] = vel
 
@@ -496,7 +507,7 @@ class CartographerProbe:
     def _stream_timeout(self, eventtime):
         if not self._stream_en:
             return self.reactor.NEVER
-        msg = "cartographer sensor not receiving data"
+        msg = "Cartographer sensor not receiving data"
         logging.error(msg)
         self.printer.invoke_shutdown(msg)
         return self.reactor.NEVER
@@ -546,7 +557,7 @@ class CartographerProbe:
                     temp = sample["temp"]
                     if self.model_temp is not None and not (-40 < temp < 180):
                         msg = ("cartographer temperature sensor faulty(read %.2f C),"
-                                " disabling temperaure compensation" % (temp,))
+                                " disabling temperature compensation" % (temp,))
                         logging.error(msg)
                         self.gcode.respond_raw("!! " + msg + "\n")
                         self.model_temp = None
@@ -589,12 +600,20 @@ class CartographerProbe:
         self._stream_flush_schedule()
 
     def _get_trapq_position(self, print_time):
-        ffi_main, ffi_lib = chelper.get_ffi()
-        data = ffi_main.new("struct pull_move[1]")
-        count = ffi_lib.trapq_extract_old(self.trapq, data, 1, 0.0, print_time)
-        if not count:
-            return None, None
-        move = data[0]
+        move = None
+        if self._last_trapq_move:
+            last = self._last_trapq_move[0]
+            last_end = last.print_time + last.move_t
+            if last.print_time <= print_time < last_end:
+                move = last
+        if move is None:
+            ffi_main, ffi_lib = chelper.get_ffi()
+            data = ffi_main.new("struct pull_move[1]")
+            count = ffi_lib.trapq_extract_old(self.trapq, data, 1, 0.0, print_time)
+            if not count:
+                return None, None
+            self._last_trapq_move = data
+            move = data[0]
         move_time = max(0.0, min(move.move_t, print_time - move.print_time))
         dist = (move.start_v + .5 * move.accel * move_time) * move_time
         pos = (move.start_x + move.x_r * dist, move.start_y + move.y_r * dist,
@@ -610,7 +629,7 @@ class CartographerProbe:
         total = skip + count
 
         def cb(sample):
-            if sample['clock'] >= settle_clock:
+            if sample["clock"] >= settle_clock:
                 samples.append(sample)
                 if len(samples) >= total:
                     raise StopStreaming
@@ -870,7 +889,7 @@ class CartographerProbe:
         old_offset = self.model.offset
         self.model.offset += offset
         self.model.save(self, False)
-        gcmd.respond_info("cartographer model offset has been updated\n"
+        gcmd.respond_info(f"Cartographer model offset has been updated to {self.model.offset}.\n"
                 "You must run the SAVE_CONFIG command now to update the\n"
                 "printer config file and restart the printer.")
         self.model.offset = old_offset
@@ -1386,11 +1405,14 @@ class CartographerMeshHelper:
     @classmethod
     def create(cls, cartographer, config):
         if config.has_section("bed_mesh"):
-            return CartographerMeshHelper(cartographer, config)
+            mesh_config = config.getsection("bed_mesh")
+            if mesh_config.get("mesh_radius", None) is not None:
+                return None  # Use normal bed meshing for round beds
+            return CartographerMeshHelper(cartographer, config, mesh_config)
         else:
             return None
 
-    def __init__(self, cartographer, config):
+    def __init__(self, cartographer, config, mesh_config):
         self.cartographer = cartographer
         mesh_config = self.mesh_config = config.getsection("bed_mesh")
         self.bm = self.cartographer.printer.load_object(mesh_config, "bed_mesh")
@@ -1414,12 +1436,16 @@ class CartographerMeshHelper:
         self.overscan = config.getfloat("mesh_overscan", -1, minval=0)
         self.cluster_size = config.getfloat("mesh_cluster_size", 1, minval=0)
         self.runs = config.getint("mesh_runs", 1, minval=1)
+        self.adaptive_margin = mesh_config.getfloat(
+            "adaptive_margin", 0, note_valid=False
+        )
         
         if self.zero_ref_pos is not None and self.rri is not None:
-            logging.info("cartographer: both 'zero_reference_position' and "
+            logging.info("Cartographer: both 'zero_reference_position' and "
                     "'relative_reference_index' options are specified. The"
                     " former will be used")
 
+        self.faulty_region_ = []
         self.faulty_regions = []
         for i in list(range(1, 100, 1)):
             start = mesh_config.getfloatlist("faulty_region_%d_min" % (i,), None,
@@ -1432,6 +1458,12 @@ class CartographerMeshHelper:
             y_min = min(start[1], end[1])
             y_max = max(start[1], end[1])
             self.faulty_regions.append(Region(x_min, x_max, y_min, y_max))
+            self.faulty_region_.append([x_min, y_min, x_max, y_max])
+        self.faulty_region_ = np.array(self.faulty_region_).T
+        self.exclude_object = None
+        self.cartographer.printer.register_event_handler(
+            "klippy:connect", self._handle_connect
+        )
 
         self.gcode = self.cartographer.printer.lookup_object("gcode")
         self.prev_gcmd = self.gcode.register_command("BED_MESH_CALIBRATE", None)
@@ -1451,6 +1483,9 @@ class CartographerMeshHelper:
             self.calibrate(gcmd)
         else:
             self.prev_gcmd(gcmd)
+
+    def _handle_connect(self):
+        self.exclude_object = self.cartographer.printer.lookup_object("exclude_object", None)
 
     def _handle_mcu_identify(self):
         # Auto determine a safe overscan amount
@@ -1554,12 +1589,13 @@ class CartographerMeshHelper:
         return points
 
     def calibrate(self, gcmd):
-        self.min_x, self.min_y = coord_fallback(gcmd, "MESH_MIN", float,
+        self.min_x, self.min_y = coord_fallback(gcmd, "MESH_MIN", convert_float,
                 self.def_min_x, self.def_min_y, lambda v, d: max(v, d))
-        self.max_x, self.max_y = coord_fallback(gcmd, "MESH_MAX", float,
+        self.max_x, self.max_y = coord_fallback(gcmd, "MESH_MAX", convert_float,
                 self.def_max_x, self.def_max_y, lambda v, d: min(v, d))
         self.res_x, self.res_y = coord_fallback(gcmd, "PROBE_COUNT", int,
                 self.def_res_x, self.def_res_y, lambda v, _d: max(v, 3))
+        self.profile_name = gcmd.get("PROFILE", "default")
 
         if self.min_x > self.max_x:
             self.min_x, self.max_x = (max(self.max_x, self.def_min_x),
@@ -1581,7 +1617,17 @@ class CartographerMeshHelper:
             self.zero_ref_mode = ("rri", self.rri)
         else:
             self.zero_ref_mode = None
-            
+                    
+        # If the user requested adaptive meshing, try to shrink the values we just configured
+        if gcmd.get_int("ADAPTIVE", 0):
+            if self.exclude_object is not None:
+                margin = gcmd.get_float("ADAPTIVE_MARGIN", self.adaptive_margin)
+                self._shrink_to_excluded_objects(gcmd, margin)
+            else:
+                gcmd.respond_info(
+                    "Requested adaptive mesh, but [exclude_object] is not enabled. Ignoring."
+                )
+
         self.step_x = (self.max_x - self.min_x) / (self.res_x - 1)
         self.step_y = (self.max_y - self.min_y) / (self.res_y - 1)
 
@@ -1616,8 +1662,53 @@ class CartographerMeshHelper:
         finally:
             self.cartographer._stop_streaming()
 
-        clusters = self._interpolate_faulty(clusters)
-        self._apply_mesh(clusters, gcmd)
+        matrix = self._process_clusters(clusters, gcmd)
+        self._apply_mesh(matrix, gcmd)
+
+    def _shrink_to_excluded_objects(self, gcmd, margin):
+        bound_min_x, bound_max_x = None, None
+        bound_min_y, bound_max_y = None, None
+        objects = self.exclude_object.get_status().get("objects", {})
+        if len(objects) == 0:
+            return
+
+        for obj in objects:
+            for point in obj["polygon"]:
+                bound_min_x = opt_min(bound_min_x, point[0])
+                bound_max_x = opt_max(bound_max_x, point[0])
+                bound_min_y = opt_min(bound_min_y, point[1])
+                bound_max_y = opt_max(bound_max_y, point[1])
+        bound_min_x -= margin
+        bound_max_x += margin
+        bound_min_y -= margin
+        bound_max_y += margin
+
+        # Calculate original step size and apply the new bounds
+        orig_span_x = self.max_x - self.min_x
+        orig_span_y = self.max_y - self.min_y
+        orig_step_x = orig_span_x / (self.res_x - 1)
+        orig_step_y = orig_span_y / (self.res_y - 1)
+
+        if bound_min_x >= self.min_x:
+            self.min_x = bound_min_x
+        if bound_max_x <= self.max_x:
+            self.max_x = bound_max_x
+        if bound_min_y >= self.min_y:
+            self.min_y = bound_min_y
+        if bound_max_y <= self.max_y:
+            self.max_y = bound_max_y
+
+        # Update resolution to retain approximately the same step size as before
+        self.res_x = math.ceil(self.res_x * (self.max_x - self.min_x) / orig_span_x)
+        self.res_y = math.ceil(self.res_y * (self.max_y - self.min_y) / orig_span_y)
+        # Guard against bicubic interpolation with 3 points on one axis
+        min_res = 3
+        if max(self.res_x, self.res_y) > 6 and min(self.res_x, self.res_y) < 4:
+            min_res = 4
+        self.res_x = max(self.res_x, min_res)
+        self.res_y = max(self.res_y, min_res)
+
+        self.profile_name = None
 
     def _fly_path(self, path, speed, runs):
         # Run through the path
@@ -1625,6 +1716,7 @@ class CartographerMeshHelper:
             p = path if i % 2 == 0 else reversed(path)
             for (x,y) in p:
                 self.toolhead.manual_move([x, y, None], speed)
+        self.toolhead.dwell(0.251)
         self.toolhead.wait_moves()
 
     def _collect_zero_ref(self, speed, coord):
@@ -1701,7 +1793,40 @@ class CartographerMeshHelper:
         gcmd.respond_info("Samples binned in %d clusters" % (len(clusters),))
 
         return clusters
+    
+    def _process_clusters(self, raw_clusters, gcmd):
+        parent_conn, child_conn = multiprocessing.Pipe()
 
+        def do():
+            try:
+                child_conn.send((False, self._do_process_clusters(raw_clusters)))
+            except:
+                child_conn.send((True, traceback.format_exc()))
+            child_conn.close()
+
+        child = multiprocessing.Process(target=do)
+        child.daemon = True
+        child.start()
+        reactor = self.cartographer.reactor
+        eventtime = reactor.monotonic()
+        while child.is_alive():
+            eventtime = reactor.pause(eventtime + 0.1)
+        is_err, result = parent_conn.recv()
+        child.join()
+        parent_conn.close()
+        if is_err:
+            raise Exception("Error processing mesh: %s" % (result,))
+        else:
+            is_inner_err, inner_result = result
+            if is_inner_err:
+                raise gcmd.error(inner_result)
+            else:
+                return inner_result
+
+    def _do_process_clusters(self, raw_clusters):
+        clusters = self._interpolate_faulty(raw_clusters)
+        return self._generate_matrix(clusters)
+  
     def _is_faulty_coordinate(self, x, y, add_offsets=False):
         if add_offsets:
             xo, yo = self.cartographer.x_offset, self.cartographer.y_offset
@@ -1714,29 +1839,30 @@ class CartographerMeshHelper:
 
     def _interpolate_faulty(self, clusters):
         faulty_indexes = []
-        xi_max = 0
-        yi_max = 0
-        for (xi, yi), points in clusters.items():
-            if xi > xi_max:
-                xi_max = xi
-            if yi > yi_max:
-                yi_max = yi
-            xc = xi * self.step_x + self.min_x
-            yc = yi * self.step_y + self.min_y
-            if self._is_faulty_coordinate(xc, yc):
-                clusters[(xi, yi)] = None
-                faulty_indexes.append((xi, yi))
+        position = np.array(list(clusters.keys()))
+        (xi_max,yi_max) = position.T.max(axis = 1)
+        pos_temp = (position.T*[[self.step_x],[self.step_y]]+[[self.min_x],[self.min_y]])
+        if len(self.faulty_region_.shape) > 1:
+            length=self.faulty_region_.shape[1]
+            flag = np.array(
+                [
+                    (pos_temp > self.faulty_region_[:2].reshape(1,2,length).T).T.all(axis=1),
+                    (pos_temp < self.faulty_region_[2:].reshape(1,2,length).T).T.all(axis=1)
+                ]
+            ).all(axis = 0).any(axis = 1)
+            for i in range(len(flag)):
+                if(flag[i]):
+                    clusters[tuple(position[i])] = None
+                    faulty_indexes.append(tuple(position[i]))
+        del pos_temp
 
         def get_nearest(start, dx, dy):
-            (x, y) = start
-            x += dx
-            y += dy
-            while (x >= 0 and x <= xi_max and
-                   y >= 0 and y <= yi_max):
-                if clusters[(x, y)] is not None:
-                    return (abs(x-start[0])+abs(y-start[0]), median(clusters[(x,y)]))
-                x += dx
-                y += dy
+            inputs = np.array(start)
+            inputs += [dx,dy]
+            while ((inputs >= 0).all() and (inputs <= [xi_max,yi_max]).all()):
+                if clusters.get(tuple(inputs),None) is not None:
+                    return (abs(inputs-np.array(start)).sum(), median(clusters[tuple(inputs)]))
+                inputs += [dx,dy]
             return None
 
         def interp_weighted(lower, higher):
@@ -1768,25 +1894,29 @@ class CartographerMeshHelper:
 
         return clusters
 
-    def _apply_mesh(self, clusters, gcmd):
+    def _generate_matrix(self, clusters):
         matrix = []
         td = self.cartographer.trigger_distance
+        empty_clusters = []
         for yi in range(self.res_y):
             line = []
             for xi in range(self.res_x):
-                cluster = clusters.get((xi,yi), None)
+                cluster = clusters.get((xi, yi), None)
                 if cluster is None or len(cluster) == 0:
                     xc = xi * self.step_x + self.min_x
                     yc = yi * self.step_y + self.min_y
-                    logging.info("Cluster (%.3f,%.3f)[%d,%d] is empty!"
-                                 % (xc, yc,
-                                    xi, yi))
-                    err = ("Empty clusters found\n"
-                           "Try increasing mesh cluster_size or slowing down")
-                    raise self.gcode.error(err)
-                data = [td-d for d in cluster]
-                line.append(median(data))
+                    empty_clusters.append("  (%.3f,%.3f)[%d,%d]" % (xc, yc, xi, yi))
+                else:
+                    data = [td - d for d in cluster]
+                    line.append(median(data))
             matrix.append(line)
+        if empty_clusters:
+            err = (
+                "Empty clusters found\n"
+                "Try increasing mesh cluster_size or slowing down.\n"
+                "The following clusters were empty:\n"
+            ) + "\n".join(empty_clusters)
+            return (True, err)
 
         z_offset = None
         if self.zero_ref_mode and self.zero_ref_mode[0] == "rri":
@@ -1802,8 +1932,10 @@ class CartographerMeshHelper:
 
         if z_offset is not None:
             for i, line in enumerate(matrix):
-                matrix[i] = [z-z_offset for z in line]
-
+                matrix[i] = [z - z_offset for z in line]
+        return (False, matrix)
+    
+    def _apply_mesh(self, matrix, gcmd):
         params = self.bm.bmc.mesh_config
         params["min_x"] = self.min_x
         params["max_x"] = self.max_x
@@ -1811,14 +1943,18 @@ class CartographerMeshHelper:
         params["max_y"] = self.max_y
         params["x_count"] = self.res_x
         params["y_count"] = self.res_y
-        mesh = bed_mesh.ZMesh(params)
+        try:
+            mesh = bed_mesh.ZMesh(params)
+        except TypeError:
+            mesh = bed_mesh.ZMesh(params, self.profile_name)
         try:
             mesh.build_mesh(matrix)
         except bed_mesh.BedMeshError as e:
             raise self.gcode.error(str(e))
         self.bm.set_mesh(mesh)
         self.gcode.respond_info("Mesh calibration complete")
-        self.bm.save_profile(gcmd.get("PROFILE", "default"))
+        if self.profile_name is not None:
+            self.bm.save_profile(self.profile_name)
 
 class Region:
     def __init__(self, x_min, x_max, y_min, y_max):
@@ -1854,7 +1990,13 @@ def arc_points(cx, cy, r, start_angle, span):
         points.append((x,y))
 
     return points
-
+    
+def convert_float(data):
+    toFloat=float(data)
+    if np.isinf(toFloat) or np.isnan(toFloat):
+        raise ValueError(f"convert error when convert string:{data} into float")
+    return toFloat
+    
 def coord_fallback(gcmd, name, parse, def_x, def_y, map=lambda v, d: v):
     param = gcmd.get(name, None)
     if param is not None:
@@ -1869,6 +2011,17 @@ def coord_fallback(gcmd, name, parse, def_x, def_y, map=lambda v, d: v):
 def median(samples):
     return float(np.median(samples))
 
+def opt_min(a, b):
+    if a is None:
+        return b
+    return min(a, b)
+
+
+def opt_max(a, b):
+    if a is None:
+        return b
+    return max(a, b)
+    
 def load_config(config):
     cartographer = CartographerProbe(config)
     config.get_printer().add_object("probe", CartographerProbeWrapper(cartographer))
