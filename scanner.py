@@ -1571,6 +1571,7 @@ class Scanner:
             
 
             self.trigger_method=1
+            sample_number = 0
             self.detect_threshold_z = threshold
             result = self._probe_accuracy_check(self.probe_speed, skip_samples, sample_count, 5, False, lift_speed)
             for pos in result.positions:
